@@ -1,0 +1,57 @@
+CONFIDENTIAL – Mutual Non-Disclosure Agreement
+MUTUAL NON-DISCLOSURE AGREEMENT
+
+This Mutual Non-Disclosure Agreement (this "Agreement") is made effective as of June 10, 2025 by and between Orion Robotics, Inc., a Delaware corporation ("Orion"), and Helix Medical Devices LLC, a New York limited liability company ("Helix"). Orion and Helix are each referred to as a "Party" and together as the "Parties".
+
+The Parties wish to explore a potential collaboration on surgical robotics (the "Purpose") and, in connection with the Purpose, may disclose Confidential Information to each other.
+
+ARTICLE I
+DEFINITIONS
+
+Section 1.1 Confidential Information. "Confidential Information" means any non-public information disclosed by a Party (the "Disclosing Party") to the other Party (the "Receiving Party"), whether orally, visually or in writing, that is designated as confidential or that reasonably should be understood to be confidential given the nature of the information and the circumstances of disclosure, including product designs, source code, clinical data, pricing and business plans.
+
+Section 1.2 Exclusions. Confidential Information does not include information that (a) is or becomes generally available to the public other than through a breach of this Agreement; (b) was known to the Receiving Party before disclosure without restriction; (c) is independently developed by the Receiving Party without use of the Confidential Information; or (d) is rightfully received from a third party without a duty of confidentiality.
+
+ARTICLE II
+OBLIGATIONS
+
+Section 2.1 Non-Use and Non-Disclosure. The Receiving Party shall use the Confidential Information solely for the Purpose and shall not disclose it to any third party except to its employees, officers and professional advisers who need to know it for the Purpose and who are bound by confidentiality obligations no less protective than this Agreement.
+
+Section 2.2 Standard of Care. The Receiving Party shall protect the Confidential Information using at least the same degree of care it uses to protect its own confidential information of a similar nature, and in no event less than a reasonable degree of care.
+
+Section 2.3 Compelled Disclosure. If the Receiving Party is required by law or court order to disclose Confidential Information, it shall give the Disclosing Party prompt written notice, to the extent legally permitted, so that the Disclosing Party may seek a protective order.
+
+Page 1 of 2
+CONFIDENTIAL – Mutual Non-Disclosure Agreement
+
+ARTICLE III
+TERM AND RETURN OF INFORMATION
+
+Section 3.1 Term. This Agreement shall remain in effect for two (2) years from the effective date. Either Party may terminate this Agreement earlier upon fifteen (15) days' written notice to the other Party.
+
+Section 3.2 Duration of Obligations. The obligations of confidentiality under this Agreement shall survive for five (5) years after the termination or expiration of this Agreement, except that obligations relating to trade secrets shall survive for as long as such information remains a trade secret under applicable law.
+
+Section 3.3 Return or Destruction. Upon the Disclosing Party's written request, the Receiving Party shall promptly return or destroy all Confidential Information and certify such destruction in writing within ten (10) business days.
+
+ARTICLE IV
+NO LICENSE; NO WARRANTY
+
+Section 4.1 No License. Nothing in this Agreement grants the Receiving Party any license or right in the Confidential Information, except the limited right to use it for the Purpose.
+
+Section 4.2 No Warranty. All Confidential Information is provided "AS IS". Neither Party makes any warranty regarding the accuracy or completeness of the Confidential Information.
+
+ARTICLE V
+REMEDIES
+
+Section 5.1 Equitable Relief. Each Party acknowledges that unauthorized disclosure of Confidential Information may cause irreparable harm for which monetary damages would be an inadequate remedy, and that the Disclosing Party shall be entitled to seek injunctive relief in addition to any other remedies available at law or in equity.
+
+ARTICLE VI
+GENERAL
+
+Section 6.1 Governing Law. This Agreement shall be governed by the laws of the State of New York, without regard to its conflict of laws principles. The state and federal courts located in New York County shall have exclusive jurisdiction over any dispute arising under this Agreement.
+
+Section 6.2 Entire Agreement. This Agreement constitutes the entire agreement between the Parties with respect to its subject matter and supersedes all prior understandings. It may be amended only by a written instrument signed by both Parties.
+
+IN WITNESS WHEREOF, the Parties have executed this Agreement as of the date first written above.
+
+Page 2 of 2
