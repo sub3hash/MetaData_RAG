@@ -6,6 +6,7 @@ without form-feeds) produce a single page whose ``number`` is ``None``.
 
 from __future__ import annotations
 
+import io
 import logging
 import re
 from collections import Counter
@@ -85,26 +86,26 @@ def clean_pages(raw_pages: list[str]) -> list[str]:
     return cleaned
 
 
-def _extract_pdf(path: Path) -> list[str]:
+def _extract_pdf(data: bytes) -> list[str]:
     import pdfplumber
 
-    with pdfplumber.open(path) as pdf:
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
         return [(page.extract_text() or "") for page in pdf.pages]
 
 
-def _extract_docx(path: Path) -> list[str]:
+def _extract_docx(data: bytes) -> list[str]:
     import docx  # python-docx
 
-    document = docx.Document(str(path))
+    document = docx.Document(io.BytesIO(data))
     # Body paragraphs only: Word headers/footers live in separate parts and are skipped.
     return ["\n".join(p.text for p in document.paragraphs)]
 
 
-def _extract_txt(path: Path) -> list[str]:
-    raw = path.read_bytes()
+def _extract_txt(data: bytes) -> list[str]:
+    text = ""
     for enc in ("utf-8-sig", "cp1252", "latin-1"):
         try:
-            text = raw.decode(enc)
+            text = data.decode(enc)
             break
         except UnicodeDecodeError:
             continue
@@ -112,30 +113,34 @@ def _extract_txt(path: Path) -> list[str]:
     return text.split("\f")  # form-feed = page break
 
 
-def extract_pages(path: Path) -> list[Page]:
-    """Extract and clean the text of ``path``.
+def extract_bytes(data: bytes, file_name: str) -> list[Page]:
+    """Extract and clean the text of a file given its content and name.
 
     Raises:
         ExtractionError: unsupported extension, unreadable file, or no text.
     """
-    suffix = path.suffix.lower()
+    suffix = Path(file_name).suffix.lower()
     extractors = {".pdf": _extract_pdf, ".docx": _extract_docx, ".txt": _extract_txt}
     if suffix not in extractors:
         raise ExtractionError(f"Unsupported file type: {suffix or '(none)'}")
     try:
-        raw_pages = extractors[suffix](path)
-    except ExtractionError:
-        raise
+        raw_pages = extractors[suffix](data)
     except Exception as exc:  # corrupt PDF, bad zip, ...
-        raise ExtractionError(f"Could not read {path.name}: {exc}") from exc
+        raise ExtractionError(f"Could not read {file_name}: {exc}") from exc
 
-    logger.info("Extracted %d raw page(s) from %s", len(raw_pages), path.name)
+    logger.info("Extracted %d raw page(s) from %s", len(raw_pages), file_name)
     cleaned = clean_pages(raw_pages)
     paginated = suffix == ".pdf" or len(raw_pages) > 1
-    pages = [
-        Page(number=(i + 1) if paginated else None, text=t)
-        for i, t in enumerate(cleaned)
-    ]
+    pages = [Page(number=(i + 1) if paginated else None, text=t) for i, t in enumerate(cleaned)]
     if not any(p.text.strip() for p in pages):
-        raise ExtractionError(f"No extractable text in {path.name}")
+        raise ExtractionError(f"No extractable text in {file_name}")
     return pages
+
+
+def extract_pages(path: Path) -> list[Page]:
+    """Extract and clean the text of a local file (see :func:`extract_bytes`)."""
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ExtractionError(f"Could not read {path.name}: {exc}") from exc
+    return extract_bytes(data, path.name)

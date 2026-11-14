@@ -1,4 +1,4 @@
-"""Embedding and chat-completion providers, query rewriting and answer generation."""
+"""Gemini embeddings and chat (Gemini API key or Vertex AI), query rewriting and answering."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import hashlib
 import logging
 import math
 import re
-from typing import Protocol, Sequence
+from typing import Any, Literal, Protocol, Sequence
 
 from app.config import Settings
 from app.prompts import ANSWER_SYSTEM_PROMPT, REWRITE_SYSTEM_PROMPT, REWRITE_USER_TEMPLATE
@@ -18,7 +18,46 @@ class LLMError(Exception):
     """Raised when an embedding / LLM provider call fails."""
 
 
-Message = dict[str, str]  # {"role": ..., "content": ...}
+Message = dict[str, str]  # {"role": "system"|"user"|"assistant", "content": ...}
+Task = Literal["document", "query"]
+
+
+def _normalise(vec: Sequence[float]) -> list[float]:
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+# --------------------------------------------------------------------------- #
+# Gemini client (Gemini API key or Vertex AI)
+# --------------------------------------------------------------------------- #
+
+
+def build_genai_client(settings: Settings) -> Any:
+    """Create a ``google.genai`` client.
+
+    * ``GOOGLE_GENAI_USE_VERTEXAI=false`` -> Gemini API with ``GOOGLE_API_KEY``.
+    * ``GOOGLE_GENAI_USE_VERTEXAI=true`` + ``GCP_PROJECT`` -> Vertex AI with
+      Application Default Credentials (service account / ``gcloud auth``).
+    * ``GOOGLE_GENAI_USE_VERTEXAI=true`` without project + ``GOOGLE_API_KEY`` ->
+      Vertex AI express mode.
+    """
+    from google import genai
+    from google.genai import types
+
+    http_options = types.HttpOptions(
+        timeout=120_000, retry_options=types.HttpRetryOptions(attempts=4, initial_delay=1.0, max_delay=20.0)
+    )
+    if settings.use_vertexai:
+        if settings.gcp_project:
+            return genai.Client(
+                vertexai=True, project=settings.gcp_project, location=settings.gcp_location, http_options=http_options
+            )
+        if settings.google_api_key:
+            return genai.Client(vertexai=True, api_key=settings.google_api_key, http_options=http_options)
+        raise LLMError("Vertex AI needs GCP_PROJECT (with ADC credentials) or GOOGLE_API_KEY (express mode)")
+    if not settings.google_api_key:
+        raise LLMError("GOOGLE_API_KEY is not set (or set GOOGLE_GENAI_USE_VERTEXAI=true)")
+    return genai.Client(api_key=settings.google_api_key, http_options=http_options)
 
 
 # --------------------------------------------------------------------------- #
@@ -27,33 +66,56 @@ Message = dict[str, str]  # {"role": ..., "content": ...}
 
 
 class Embedder(Protocol):
-    """Anything that turns texts into vectors."""
+    """Turns texts into unit-length vectors. ``task`` separates documents from queries."""
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
+    def embed(self, texts: Sequence[str], task: Task = "document") -> list[list[float]]: ...
 
 
-class OpenAIEmbedder:
-    """OpenAI (or OpenAI-compatible) embeddings, batched."""
+class GeminiEmbedder:
+    """Gemini embeddings (``gemini-embedding-001`` by default), batched and L2-normalised.
 
-    def __init__(self, model: str, api_key: str | None, base_url: str | None, batch_size: int = 64) -> None:
-        from openai import OpenAI
+    Uses task types ``RETRIEVAL_DOCUMENT`` for chunks and ``RETRIEVAL_QUERY`` for
+    questions. Vectors are normalised because a reduced ``output_dimensionality``
+    is not unit-length by default.
+    """
 
-        if not api_key:
-            raise LLMError("OPENAI_API_KEY is not set")
+    def __init__(self, client: Any, model: str, dim: int, batch_size: int = 50) -> None:
+        self._client = client
         self.model = model
-        self.batch_size = batch_size
-        self._client = OpenAI(api_key=api_key, base_url=base_url, max_retries=3, timeout=60)
+        self.dim = dim
+        self.batch_size = max(1, batch_size)
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def _call(self, batch: list[str], task_type: str) -> list[list[float]]:
+        from google.genai import types
+
+        resp = self._client.models.embed_content(
+            model=self.model,
+            contents=batch,
+            config=types.EmbedContentConfig(task_type=task_type, output_dimensionality=self.dim),
+        )
+        vectors = [_normalise(e.values or []) for e in (resp.embeddings or [])]
+        if len(vectors) != len(batch):
+            raise LLMError(f"Expected {len(batch)} embeddings, got {len(vectors)}")
+        return vectors
+
+    def embed(self, texts: Sequence[str], task: Task = "document") -> list[list[float]]:
+        task_type = "RETRIEVAL_DOCUMENT" if task == "document" else "RETRIEVAL_QUERY"
         out: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = list(texts[start : start + self.batch_size])
             try:
-                resp = self._client.embeddings.create(model=self.model, input=batch)
+                out.extend(self._call(batch, task_type))
             except Exception as exc:
-                raise LLMError(f"Embedding request failed: {exc}") from exc
-            out.extend(d.embedding for d in sorted(resp.data, key=lambda d: d.index))
-            logger.info("Embedded batch %d-%d", start, start + len(batch) - 1)
+                if len(batch) == 1:
+                    raise LLMError(f"Embedding request failed: {exc}") from exc
+                # Some endpoints accept only one input per request: retry one by one.
+                logger.warning("Batch embedding failed (%s); retrying one text per request", exc)
+                try:
+                    for text in batch:
+                        out.extend(self._call([text], task_type))
+                except Exception as exc2:
+                    raise LLMError(f"Embedding request failed: {exc2}") from exc2
+            logger.info("Embedded %s batch %d-%d", task, start, start + len(batch) - 1)
         return out
 
 
@@ -79,19 +141,18 @@ class HashEmbedder:
                 continue
             h = int.from_bytes(hashlib.md5(tok.encode()).digest()[:8], "big")
             vec[h % self.dim] += 1.0 if (h >> 63) & 1 else -1.0
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [v / norm for v in vec]
+        return _normalise(vec)
 
-    def embed(self, texts: Sequence[str]) -> list[list[float]]:
+    def embed(self, texts: Sequence[str], task: Task = "document") -> list[list[float]]:
         return [self._vector(t) for t in texts]
 
 
 def build_embedder(settings: Settings) -> Embedder:
     """Create the embedder selected by ``EMBEDDING_PROVIDER``."""
     provider = settings.embedding_provider.lower()
-    if provider == "openai":
-        return OpenAIEmbedder(
-            settings.embedding_model, settings.openai_api_key, settings.openai_base_url, settings.embed_batch_size
+    if provider == "gemini":
+        return GeminiEmbedder(
+            build_genai_client(settings), settings.embedding_model, settings.embedding_dim, settings.embed_batch_size
         )
     if provider == "hash":
         return HashEmbedder()
@@ -104,36 +165,50 @@ def build_embedder(settings: Settings) -> Embedder:
 
 
 class ChatModel(Protocol):
-    """Anything that completes a list of chat messages."""
+    """Completes a list of chat messages (system / user / assistant)."""
 
     def complete(self, messages: list[Message], temperature: float = 0.1) -> str: ...
 
 
-class OpenAIChatModel:
-    """OpenAI (or OpenAI-compatible) chat completions."""
+class GeminiChatModel:
+    """Gemini chat (``gemini-2.5-flash`` by default).
 
-    def __init__(self, model: str, api_key: str | None, base_url: str | None) -> None:
-        from openai import OpenAI
+    System messages become the ``system_instruction``; ``assistant`` turns map to
+    Gemini's ``model`` role.
+    """
 
-        if not api_key:
-            raise LLMError("OPENAI_API_KEY is not set")
+    def __init__(self, client: Any, model: str) -> None:
+        self._client = client
         self.model = model
-        self._client = OpenAI(api_key=api_key, base_url=base_url, max_retries=3, timeout=120)
 
     def complete(self, messages: list[Message], temperature: float = 0.1) -> str:
+        from google.genai import types
+
+        system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
+        contents = [
+            types.Content(role="model" if m["role"] == "assistant" else "user", parts=[types.Part(text=m["content"])])
+            for m in messages
+            if m["role"] != "system"
+        ]
         try:
-            resp = self._client.chat.completions.create(
-                model=self.model, messages=messages, temperature=temperature  # type: ignore[arg-type]
+            resp = self._client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=types.GenerateContentConfig(system_instruction=system or None, temperature=temperature),
             )
         except Exception as exc:
             raise LLMError(f"LLM request failed: {exc}") from exc
-        return (resp.choices[0].message.content or "").strip()
+        text = (resp.text or "").strip()
+        if not text:
+            reason = resp.candidates[0].finish_reason if resp.candidates else "no candidates"
+            raise LLMError(f"LLM returned an empty response (finish_reason={reason})")
+        return text
 
 
 def build_chat_model(settings: Settings) -> ChatModel:
     """Create the chat model selected by ``LLM_PROVIDER``."""
-    if settings.llm_provider.lower() == "openai":
-        return OpenAIChatModel(settings.llm_model, settings.openai_api_key, settings.openai_base_url)
+    if settings.llm_provider.lower() == "gemini":
+        return GeminiChatModel(build_genai_client(settings), settings.llm_model)
     raise ValueError(f"Unknown LLM_PROVIDER: {settings.llm_provider}")
 
 

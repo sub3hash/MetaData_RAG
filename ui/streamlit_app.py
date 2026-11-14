@@ -107,7 +107,7 @@ with st.sidebar:
         documents = []
 
     if not documents:
-        st.info("No .pdf, .docx or .txt files found in the contracts folder.")
+        st.info("No .pdf, .docx or .txt files found in the contract source (GCS bucket or local folder).")
 
     for doc in documents:
         is_selected = bool(st.session_state.selected and st.session_state.selected["doc_id"] == doc["doc_id"])

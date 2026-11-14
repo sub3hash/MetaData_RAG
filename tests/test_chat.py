@@ -1,15 +1,18 @@
 """Tests for document isolation (doc_id filter) and "not found" behaviour.
 
-Uses the offline HashEmbedder, an in-memory Chroma client, a temp SQLite file
-and a fake LLM, so no network/API key is needed.
+Runs fully offline: local folder source, SQLite registry, the HashEmbedder, a
+fake LLM, and two vector stores - an in-memory Chroma collection and
+``VertexVectorStore`` backed by a fake Vertex AI index/endpoint that applies
+namespace restricts the way Vector Search does.
 """
 
 from __future__ import annotations
 
 import shutil
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -19,7 +22,8 @@ from app.db import DocumentRegistry
 from app.llm import HashEmbedder, LLMError, Message
 from app.prompts import NOT_FOUND
 from app.services import ContractService
-from app.vectorstore import VectorStore
+from app.sources import LocalFolderSource
+from app.vectorstore import ChromaVectorStore, InMemoryChunkStore, VertexVectorStore
 
 CONTRACTS = Path(__file__).resolve().parent.parent / "contracts"
 MSA = "master_services_agreement.txt"
@@ -27,7 +31,7 @@ NDA = "mutual_nda.txt"
 
 
 class FakeLLM:
-    """Records calls; answers by citing the first clause in the context."""
+    """Records calls; answers by citing a clause."""
 
     def __init__(self, reply: str | None = None) -> None:
         self.calls: list[list[Message]] = []
@@ -45,28 +49,84 @@ class FakeLLM:
 class CountingEmbedder(HashEmbedder):
     def __init__(self) -> None:
         super().__init__()
-        self.calls = 0
+        self.calls: list[str] = []
 
-    def embed(self, texts):  # type: ignore[override]
-        self.calls += 1
-        return super().embed(texts)
+    def embed(self, texts, task="document"):  # type: ignore[override]
+        self.calls.append(task)
+        return super().embed(texts, task)
 
 
-@pytest.fixture()
-def service(tmp_path: Path) -> ContractService:
+# --------------------------------------------------------------------------- #
+# Fake Vertex AI Vector Search (index + endpoint)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class _Neighbor:
+    id: str
+    distance: float
+
+
+class FakeVertexIndex:
+    def __init__(self) -> None:
+        self.points: dict[str, tuple[list[float], dict[str, list[str]]]] = {}
+
+    def upsert_datapoints(self, datapoints: list[Any]) -> None:
+        for dp in datapoints:
+            restricts = {r.namespace: list(r.allow_list) for r in dp.restricts}
+            self.points[dp.datapoint_id] = (list(dp.feature_vector), restricts)
+
+    def remove_datapoints(self, datapoint_ids: list[str]) -> None:
+        for i in datapoint_ids:
+            self.points.pop(i, None)
+
+
+class FakeVertexEndpoint:
+    def __init__(self, index: FakeVertexIndex) -> None:
+        self.index = index
+        self.filters: list[Any] = []
+
+    def find_neighbors(self, *, deployed_index_id, queries, num_neighbors, filter):  # noqa: A002
+        self.filters.append(filter)
+        q = queries[0]
+        out = []
+        for pid, (vec, restricts) in self.index.points.items():
+            if all(set(ns.allow_tokens) & set(restricts.get(ns.name, [])) for ns in filter):
+                out.append(_Neighbor(pid, sum(a * b for a, b in zip(q, vec))))  # DOT_PRODUCT_DISTANCE
+        return [sorted(out, key=lambda n: -n.distance)[:num_neighbors]]
+
+
+def _make_store(kind: str):
+    if kind == "chroma":
+        return ChromaVectorStore(None, collection=f"test_{uuid.uuid4().hex}")
+    index = FakeVertexIndex()
+    return VertexVectorStore(index, FakeVertexEndpoint(index), "deployed", InMemoryChunkStore())
+
+
+@pytest.fixture(params=["chroma", "vertex"])
+def service(request: pytest.FixtureRequest, tmp_path: Path) -> ContractService:
     contracts = tmp_path / "contracts"
     contracts.mkdir()
     for name in (MSA, NDA):
         shutil.copy(CONTRACTS / name, contracts / name)
     settings = replace(
         Settings(),
+        contracts_source="local",
         contracts_dir=contracts,
+        registry_backend="sqlite",
         sqlite_path=tmp_path / "docs.db",
+        vector_store=request.param,
         similarity_threshold=0.05,
         top_k=5,
     )
-    store = VectorStore(None, collection=f"test_{uuid.uuid4().hex}")
-    return ContractService(settings, DocumentRegistry(settings.sqlite_path), store, CountingEmbedder(), FakeLLM())
+    return ContractService(
+        settings,
+        LocalFolderSource(contracts, settings.supported_extensions),
+        DocumentRegistry(settings.sqlite_path),
+        _make_store(request.param),
+        CountingEmbedder(),
+        FakeLLM(),
+    )
 
 
 def _ids(service: ContractService) -> dict[str, str]:
@@ -86,9 +146,10 @@ def test_listing_and_indexing_statuses(service: ContractService) -> None:
     # Already ready -> no re-embedding
     embedder = service.embedder
     assert isinstance(embedder, CountingEmbedder)
-    calls = embedder.calls
+    calls = len(embedder.calls)
     service.index_document(doc_id)
-    assert embedder.calls == calls
+    assert len(embedder.calls) == calls
+    assert embedder.calls == ["document"]  # chunks use the document task type
 
     # Forced re-index replaces (does not duplicate) chunks
     service.index_document(doc_id, force=True)
@@ -124,6 +185,13 @@ def test_chat_with_doc_a_never_returns_chunks_from_doc_b(service: ContractServic
         hits = service.retrieve(nda_id, question)
         assert len(hits) == service.settings.top_k
         assert all(h.metadata["doc_id"] == nda_id for h in hits)
+
+    if isinstance(service.store, VertexVectorStore):  # every Vertex query carried the doc_id restrict
+        endpoint = service.store.endpoint
+        assert endpoint.filters and all(
+            [(ns.name, ns.allow_tokens) for ns in f] in ([("doc_id", [msa_id])], [("doc_id", [nda_id])])
+            for f in endpoint.filters
+        )
 
     # The context the LLM sees for doc A contains nothing from doc B.
     llm = service.llm
@@ -175,7 +243,7 @@ def test_failed_status_on_bad_file_and_api_error(service: ContractService) -> No
     assert info.status == "failed" and "No extractable text" in (info.error or "")
 
     class BrokenEmbedder:
-        def embed(self, texts):
+        def embed(self, texts, task="document"):
             raise LLMError("API down")
 
     service._embedder = BrokenEmbedder()

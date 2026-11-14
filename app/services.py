@@ -11,13 +11,12 @@ import logging
 import re
 import threading
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from app.chunking import chunk_document
 from app.config import Settings
-from app.db import DocumentRecord, DocumentRegistry
-from app.extract import ExtractionError, extract_pages
+from app.db import DocumentRecord, Registry
+from app.extract import ExtractionError, extract_bytes
 from app.llm import (
     ChatModel,
     Embedder,
@@ -29,13 +28,14 @@ from app.llm import (
     rewrite_question,
 )
 from app.prompts import CONTEXT_TEMPLATE, NOT_FOUND
+from app.sources import ContractSource, SourceFile
 from app.vectorstore import RetrievedChunk, VectorStore
 
 logger = logging.getLogger(__name__)
 
 
 class DocumentNotFound(Exception):
-    """Unknown doc_id (file missing from the contracts folder)."""
+    """Unknown doc_id (file missing from the contract source)."""
 
 
 class DocumentNotReady(Exception):
@@ -68,13 +68,9 @@ class ChatResult:
     standalone_question: str | None = None
 
 
-def file_sha256(path: Path) -> str:
+def sha256_bytes(data: bytes) -> str:
     """SHA-256 of the file content (the document id)."""
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for block in iter(lambda: fh.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
+    return hashlib.sha256(data).hexdigest()
 
 
 class ContractService:
@@ -83,7 +79,8 @@ class ContractService:
     def __init__(
         self,
         settings: Settings,
-        registry: DocumentRegistry,
+        source: ContractSource,
+        registry: Registry,
         store: VectorStore,
         embedder: Embedder | None = None,
         llm: ChatModel | None = None,
@@ -91,13 +88,14 @@ class ContractService:
         llm_factory: Callable[[Settings], ChatModel] = build_chat_model,
     ) -> None:
         self.settings = settings
+        self.source = source
         self.registry = registry
         self.store = store
         self._embedder = embedder
         self._llm = llm
         self._embedder_factory = embedder_factory
         self._llm_factory = llm_factory
-        self._hash_cache: dict[Path, tuple[float, int, str]] = {}
+        self._hash_cache: dict[tuple[str, str, int], str] = {}
         self._lock = threading.Lock()
 
     # Providers are created lazily so a missing API key fails a request, not startup.
@@ -117,23 +115,21 @@ class ContractService:
     # Discovery
     # ------------------------------------------------------------------ #
 
-    def _scan(self) -> dict[str, Path]:
-        """Map doc_id -> path for every supported file in the contracts folder."""
-        folder = self.settings.contracts_dir
-        folder.mkdir(parents=True, exist_ok=True)
-        found: dict[str, Path] = {}
+    def _scan(self) -> dict[str, SourceFile]:
+        """Map doc_id -> file for every supported file in the contract source.
+
+        Hashes are cached per (key, version, size) so unchanged files are not
+        downloaded/re-hashed on every listing.
+        """
+        found: dict[str, SourceFile] = {}
         with self._lock:
-            for path in sorted(folder.iterdir()):
-                if not path.is_file() or path.suffix.lower() not in self.settings.supported_extensions:
-                    continue
-                st = path.stat()
-                cached = self._hash_cache.get(path)
-                if cached and cached[0] == st.st_mtime and cached[1] == st.st_size:
-                    doc_id = cached[2]
-                else:
-                    doc_id = file_sha256(path)
-                    self._hash_cache[path] = (st.st_mtime, st.st_size, doc_id)
-                found[doc_id] = path
+            for f in self.source.list_files():
+                cache_key = (f.key, f.version, f.size)
+                doc_id = self._hash_cache.get(cache_key)
+                if doc_id is None:
+                    doc_id = sha256_bytes(self.source.read_bytes(f.key))
+                    self._hash_cache[cache_key] = doc_id
+                found[doc_id] = f
         return found
 
     def list_documents(self) -> list[DocumentInfo]:
@@ -143,8 +139,8 @@ class ContractService:
         rows and vectors of doc_ids no longer present on disk are removed.
         """
         files = self._scan()
-        for doc_id, path in files.items():
-            self.registry.upsert_file(doc_id, path.name)
+        for doc_id, f in files.items():
+            self.registry.upsert_file(doc_id, f.file_name)
         for rec in self.registry.all():
             if rec.doc_id not in files:
                 logger.info("Pruning stale document %s (%s)", rec.doc_id[:12], rec.file_name)
@@ -154,17 +150,17 @@ class ContractService:
                     logger.exception("Could not delete vectors for %s", rec.doc_id[:12])
                 self.registry.delete(rec.doc_id)
         out = []
-        for doc_id, path in files.items():
+        for doc_id, f in files.items():
             rec = self.registry.get(doc_id)
             assert rec is not None
-            out.append(self._info(rec, path))
+            out.append(self._info(rec, f))
         return sorted(out, key=lambda d: d.file_name.lower())
 
-    def _info(self, rec: DocumentRecord, path: Path) -> DocumentInfo:
+    def _info(self, rec: DocumentRecord, f: SourceFile) -> DocumentInfo:
         return DocumentInfo(
             doc_id=rec.doc_id,
-            file_name=rec.file_name,
-            size=path.stat().st_size if path.exists() else 0,
+            file_name=f.file_name,
+            size=f.size,
             status=rec.status,
             num_chunks=rec.num_chunks,
             indexed_at=rec.indexed_at,
@@ -175,7 +171,7 @@ class ContractService:
         files = self._scan()
         if doc_id not in files:
             raise DocumentNotFound(doc_id)
-        rec = self.registry.get(doc_id) or self.registry.upsert_file(doc_id, files[doc_id].name)
+        rec = self.registry.get(doc_id) or self.registry.upsert_file(doc_id, files[doc_id].file_name)
         return self._info(rec, files[doc_id])
 
     # ------------------------------------------------------------------ #
@@ -199,14 +195,17 @@ class ContractService:
     def run_index(self, doc_id: str) -> None:
         """Extract → chunk → embed → upsert. Status ends as ``ready`` or ``failed``."""
         files = self._scan()
-        path = files.get(doc_id)
-        if path is None:
+        f = files.get(doc_id)
+        if f is None:
             self.registry.mark_failed(doc_id, "File no longer exists")
             return
         s = self.settings
         try:
-            logger.info("[%s] Step 1/5: extracting text from %s", doc_id[:12], path.name)
-            pages = extract_pages(path)
+            logger.info("[%s] Step 1/5: extracting text from %s", doc_id[:12], f.file_name)
+            data = self.source.read_bytes(f.key)
+            if sha256_bytes(data) != doc_id:
+                raise ExtractionError("File changed while indexing; refresh the list and try again")
+            pages = extract_bytes(data, f.file_name)
 
             logger.info("[%s] Step 2/5: clause-based chunking", doc_id[:12])
             chunks = chunk_document(
@@ -221,11 +220,11 @@ class ContractService:
                 raise ExtractionError("No chunks produced (empty text?)")
 
             logger.info("[%s] Step 3/5: embedding %d chunk(s)", doc_id[:12], len(chunks))
-            embeddings = self.embedder.embed([c.text for c in chunks])
+            embeddings = self.embedder.embed([c.text for c in chunks], task="document")
 
             logger.info("[%s] Step 4/5: replacing chunks in vector store", doc_id[:12])
             self.store.delete_document(doc_id)
-            self.store.add_chunks(doc_id, path.name, chunks, embeddings)
+            self.store.add_chunks(doc_id, f.file_name, chunks, embeddings)
 
             self.registry.mark_ready(doc_id, len(chunks))
             logger.info("[%s] Step 5/5: ready (%d chunks)", doc_id[:12], len(chunks))
@@ -248,8 +247,10 @@ class ContractService:
 
     def retrieve(self, doc_id: str, question: str) -> list[RetrievedChunk]:
         """Top-k chunks of ``doc_id`` above the similarity threshold."""
-        [vector] = self.embedder.embed([question])
+        [vector] = self.embedder.embed([question], task="query")
         results = self.store.query(doc_id, vector, top_k=self.settings.top_k)
+        # Defence in depth: the store already filters on doc_id; never let anything else through.
+        results = [r for r in results if r.metadata.get("doc_id") == doc_id]
         threshold = self.settings.similarity_threshold
         kept = [r for r in results if r.similarity >= threshold]
         logger.info(

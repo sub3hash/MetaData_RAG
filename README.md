@@ -1,54 +1,89 @@
-# Contract Document Chat (document-scoped RAG)
+# Contract Document Chat (document-scoped RAG on Google Cloud)
 
-Pick a contract from a list, the app embeds it into ChromaDB (only if it isn't
-indexed already), and you chat with **only that contract**. Answers are grounded
-in the contract text and cite clause numbers.
+Pick a contract from a list. The app embeds it (only if it isn't indexed already),
+and you chat with **only that contract**. Answers are grounded in the contract text
+and cite clause numbers.
 
-- **Backend:** FastAPI (`app/`)
-- **Frontend:** Streamlit (`ui/streamlit_app.py`)
-- **Extraction:** pdfplumber (PDF), python-docx (DOCX), plain read (TXT)
-- **Vector DB:** ChromaDB, persistent in `./chroma_db`, one collection filtered by `doc_id`
-- **Embeddings / LLM:** OpenAI `text-embedding-3-small` / `gpt-4o-mini` by default (configurable)
+| Concern | Google Cloud (default) | Local alternative (dev/tests) |
+|---|---|---|
+| Embeddings | Gemini `gemini-embedding-001` (768-d, `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY`) | `hash` (offline, lexical) |
+| LLM | Gemini `gemini-2.5-flash`, via Gemini API key **or** Vertex AI | – |
+| Contract files | Cloud Storage bucket (`gs://BUCKET/contracts/`) | `./contracts` folder |
+| Document registry | Firestore collection `contract_documents` | SQLite |
+| Vectors | Vertex AI Vector Search (streaming index, `doc_id` restrict) | ChromaDB |
+| Chunk text + metadata | Firestore collection `contract_chunks` | (inside ChromaDB) |
 
-## Setup
+Backend: FastAPI (`app/`). Frontend: Streamlit (`ui/streamlit_app.py`). Extraction uses
+pdfplumber (PDF), python-docx (DOCX) and a plain read (TXT).
+
+## Google Cloud setup
+
+1. Enable the APIs:
+   ```bash
+   gcloud services enable aiplatform.googleapis.com firestore.googleapis.com storage.googleapis.com --project YOUR_PROJECT
+   ```
+2. Create a Firestore database in Native mode (skip if you already have one):
+   ```bash
+   gcloud firestore databases create --location=us-central1 --project YOUR_PROJECT
+   ```
+3. Authenticate for Cloud Storage, Firestore and Vector Search using Application Default Credentials:
+   ```bash
+   gcloud auth application-default login
+   ```
+   Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key. The account needs
+   *Storage Object Admin*, *Cloud Datastore User* and *Vertex AI User* (plus
+   *Vertex AI Administrator* to run the setup script).
+4. Create the bucket and the Vector Search index and endpoint, then deploy the index. Deployment takes about 20–40 minutes:
+   ```bash
+   python scripts/setup_gcp.py --project YOUR_PROJECT --region us-central1 --bucket YOUR_BUCKET --upload-samples
+   ```
+   The script prints the `VERTEX_*` values for `.env`. A deployed index is billed per node-hour
+   even when idle, so undeploy it when you're not using it.
+5. Configure Gemini in `.env`, choosing one option:
+   - **Gemini API key** (AI Studio): `GOOGLE_API_KEY=...`, `GOOGLE_GENAI_USE_VERTEXAI=false`
+   - **Vertex AI** (ADC): `GOOGLE_GENAI_USE_VERTEXAI=true` with `GCP_PROJECT` and `GCP_LOCATION`
+   - **Vertex AI express mode**: `GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_API_KEY=<vertex key>`, `GCP_PROJECT` unset
+
+## Install and run
 
 ```bash
 python -m venv .venv && source .venv/bin/activate   # Python 3.11+
 pip install -r requirements.txt
-cp .env.example .env        # then set OPENAI_API_KEY
-```
-
-Put your `.pdf`, `.docx` or `.txt` contracts in `./contracts` (two samples are included).
-
-## Run
-
-```bash
+cp .env.example .env        # fill in project, bucket, key and VERTEX_* values
 uvicorn app.main:app --reload          # backend on http://localhost:8000 (docs at /docs)
 streamlit run ui/streamlit_app.py      # frontend on http://localhost:8501
 ```
 
-Run the tests (they need no API key or network):
+To add contracts, upload them to the bucket and press **Refresh list**:
+
+```bash
+gsutil cp my_contract.pdf gs://YOUR_BUCKET/contracts/
+```
+
+**Local mode** (no GCP for storage/vectors; Gemini still needs a key for chat):
+`CONTRACTS_SOURCE=local REGISTRY_BACKEND=sqlite VECTOR_STORE=chroma`.
+Add `EMBEDDING_PROVIDER=hash` to index with no API at all.
+
+The tests need no network, key or project:
 
 ```bash
 pytest -q
 ```
 
-### Configuration (`.env`)
+### Configuration
+
+All settings are listed in `.env.example`. The key ones:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `EMBEDDING_PROVIDER` | `openai` | `openai`, or `hash` (offline lexical embedder for demos/tests) |
-| `EMBEDDING_MODEL` | `text-embedding-3-small` | embedding model |
-| `LLM_PROVIDER` / `LLM_MODEL` | `openai` / `gpt-4o-mini` | answering + rewrite model |
-| `OPENAI_BASE_URL` | – | any OpenAI-compatible endpoint (Azure proxy, vLLM, Ollama, ...) |
+| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `gemini-embedding-001` / `768` | dimension must match the index |
+| `LLM_MODEL` | `gemini-2.5-flash` | answering + follow-up rewrite model |
+| `TOP_K` | `5` | clauses retrieved per question |
+| `SIMILARITY_THRESHOLD` | `0.5` | cosine cut-off (`0` disables). Tune it on your data: the backend logs every score. |
 | `MAX_CHUNK_TOKENS` / `MIN_CHUNK_TOKENS` | `800` / `50` | split / merge thresholds |
-| `FALLBACK_CHUNK_SIZE` / `FALLBACK_CHUNK_OVERLAP` | `1000` / `150` | fallback splitter (chars) |
-| `TOP_K` | `5` | chunks retrieved per question |
-| `SIMILARITY_THRESHOLD` | `0.2` | cosine similarity cut-off (`0` keeps everything) |
-| `CONTRACTS_DIR`, `CHROMA_DIR`, `SQLITE_PATH` | `./contracts`, `./chroma_db`, `./data/documents.db` | paths |
 
-If you change the embedding model, re-index your documents (the **Re-index** button,
-or `POST /documents/{doc_id}/index?force=true`). Query and chunk vectors must come from the same model.
+If you change the embedding model or dimension, create a new index with the matching
+dimension and re-index the documents (the **Re-index** button, or `?force=true`).
 
 ## API
 
@@ -69,22 +104,30 @@ that no longer exists are pruned on the next listing.
 flowchart LR
     UI[Streamlit UI] -- REST --> API[FastAPI app/main.py]
     API --> SVC[ContractService app/services.py]
-    SVC --> REG[(SQLite documents table app/db.py)]
-    SVC -- index --> EX[extract.py: pdfplumber / python-docx / txt + header/footer cleanup]
+    SVC --> REG[(Firestore contract_documents)]
+    SVC -- list / download --> GCS[(Cloud Storage bucket)]
+    SVC -- index --> EX[extract.py: PDF / DOCX / TXT + header/footer cleanup]
     EX --> CH[chunking.py: clause detection, merge/split, fallback]
-    CH --> EMB[llm.py: embeddings in batches]
-    EMB --> VS[(ChromaDB app/vectorstore.py, one collection, metadata doc_id)]
-    SVC -- chat --> RW[llm.py: rewrite follow-up to standalone]
-    RW --> Q[embed question, then query with where doc_id]
+    CH --> EMB[Gemini embeddings RETRIEVAL_DOCUMENT]
+    EMB --> VS[(Vertex AI Vector Search, restrict doc_id)]
+    EMB --> CS[(Firestore contract_chunks: text + metadata)]
+    SVC -- chat --> RW[Gemini: rewrite follow-up]
+    RW --> Q[Gemini embedding RETRIEVAL_QUERY, find_neighbors filtered by doc_id]
     Q --> VS
+    Q --> CS
     Q -- nothing above threshold --> NF[Not found in this contract. No LLM call]
-    Q -- top-k clauses --> GEN[llm.py: answer, temperature 0.1, system prompt]
+    Q -- top-k clauses --> GEN[Gemini answer, temperature 0.1]
     GEN --> CIT[answer + citations]
 ```
 
+Vector Search stores only vectors. Each datapoint (`{doc_id}_{chunk_index}`) carries a
+`doc_id` restrict, and every query passes `Namespace("doc_id", [doc_id])`, so neighbours can only
+come from the selected contract. The text and metadata of the returned ids are read from
+Firestore, and any result whose `doc_id` doesn't match is dropped as a second check.
+
 **Ingestion** (`POST /documents/{id}/index`): status `processing`, then extract and clean,
 then clause chunking, then embed in batches, then delete old chunks for the `doc_id` and upsert,
-then status `ready`. Any error (unsupported file, empty text, API failure) sets the status to `failed`
+then status `ready`. Any error (unsupported file, empty text, Gemini/GCP API failure) sets the status to `failed`
 with the message stored in the registry and logged. Documents left in `processing` by a crash are
 reset at startup.
 
@@ -131,24 +174,29 @@ Chunk metadata: `doc_id, file_name, clause_no, clause_title, chunk_index, page` 
 
 ```
 app/
-  main.py         FastAPI routes
+  main.py         FastAPI routes + wiring of the backends
   config.py       settings from .env
-  db.py           SQLite document registry
+  db.py           document registry: Firestore (default) / SQLite
+  sources.py      contract files: Cloud Storage (default) / local folder
   extract.py      text extraction + cleaning
   chunking.py     clause detection, split/merge, fallback splitter
-  vectorstore.py  ChromaDB wrapper (add, delete, query with doc_id filter)
-  llm.py          embeddings, query rewriting, answer generation
+  vectorstore.py  Vertex AI Vector Search + Firestore chunk store (default) / ChromaDB
+  llm.py          Gemini client (API key or Vertex AI), embeddings, rewrite, answer
   prompts.py      system and rewrite prompts
-  services.py     ingestion + chat orchestration (kept out of the routes for testability)
+  services.py     ingestion + chat orchestration
+scripts/setup_gcp.py  creates bucket, Vector Search index + endpoint, deploys the index
 ui/streamlit_app.py
 tests/
   test_chunking.py  clause regex, validation, long-clause split, tiny merge, fallback, cleaning
-  test_chat.py      doc_id isolation, "not found" (no LLM call), statuses, API
-contracts/          two sample .txt contracts
+  test_chat.py      doc_id isolation (Chroma and a fake Vertex index), "not found", statuses, API
+  test_gcp.py       Gemini adapters (task types, batching, role mapping), client auth modes
+contracts/          two sample .txt contracts (upload with --upload-samples)
 ```
 
 ## Notes
 
-- Token counts use `tiktoken` (`cl100k_base`). If the encoding can't be downloaded
-  (offline), the app falls back to an estimate of chars/4.
+- Chunk sizes are measured with `tiktoken` (`cl100k_base`) as an approximation of Gemini
+  tokens. If the encoding can't be downloaded, the app falls back to an estimate of chars/4.
+- The Gemini, Cloud Storage, Firestore and Vector Search adapters have unit tests with fakes,
+  but have not been run against a live project yet.
 - Assumes text-only contracts. Scanned PDFs (no text layer) end up as `failed` with "No extractable text".

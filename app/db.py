@@ -1,4 +1,9 @@
-"""SQLite registry of contract documents and their indexing status."""
+"""Registry of contract documents and their indexing status.
+
+Two interchangeable backends with the same interface (:class:`Registry`):
+:class:`FirestoreRegistry` (default, Google Cloud) and :class:`DocumentRegistry`
+(SQLite ``documents`` table, for local development and tests).
+"""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Any, Iterator, Literal, Protocol
 
 Status = Literal["not_indexed", "processing", "ready", "failed"]
 
@@ -23,6 +28,24 @@ class DocumentRecord:
     num_chunks: int | None
     indexed_at: str | None
     error: str | None = None
+
+
+class Registry(Protocol):
+    """Interface shared by the SQLite and Firestore registries."""
+
+    def upsert_file(self, doc_id: str, file_name: str) -> DocumentRecord: ...
+    def get(self, doc_id: str) -> DocumentRecord | None: ...
+    def all(self) -> list[DocumentRecord]: ...
+    def try_mark_processing(self, doc_id: str) -> bool: ...
+    def mark_ready(self, doc_id: str, num_chunks: int) -> None: ...
+    def mark_failed(self, doc_id: str, error: str) -> None: ...
+    def reset_status(self, doc_id: str) -> None: ...
+    def reset_stale_processing(self) -> int: ...
+    def delete(self, doc_id: str) -> None: ...
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class DocumentRegistry:
@@ -106,7 +129,7 @@ class DocumentRegistry:
             cur.execute(
                 "UPDATE documents SET status = 'ready', num_chunks = ?, indexed_at = ?, error = NULL "
                 "WHERE doc_id = ?",
-                (num_chunks, datetime.now(timezone.utc).isoformat(timespec="seconds"), doc_id),
+                (num_chunks, _now(), doc_id),
             )
 
     def mark_failed(self, doc_id: str, error: str) -> None:
@@ -134,3 +157,104 @@ class DocumentRegistry:
     def delete(self, doc_id: str) -> None:
         with self._tx() as cur:
             cur.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+
+
+class FirestoreRegistry:
+    """Registry stored in a Firestore collection (one document per doc_id)."""
+
+    def __init__(self, project: str | None, database: str, collection: str) -> None:
+        from google.cloud import firestore
+
+        self._firestore = firestore
+        self._client = firestore.Client(project=project, database=database)
+        self._col = self._client.collection(collection)
+
+    @staticmethod
+    def _record(doc_id: str, data: dict[str, Any]) -> DocumentRecord:
+        return DocumentRecord(
+            doc_id=doc_id,
+            file_name=data.get("file_name", ""),
+            status=data.get("status", "not_indexed"),
+            num_chunks=data.get("num_chunks"),
+            indexed_at=data.get("indexed_at"),
+            error=data.get("error"),
+        )
+
+    def upsert_file(self, doc_id: str, file_name: str) -> DocumentRecord:
+        """Register a file (status ``not_indexed`` if new) and refresh its name."""
+        ref = self._col.document(doc_id)
+        snap = ref.get()
+        if not snap.exists:
+            from google.api_core.exceptions import AlreadyExists
+
+            data = {"file_name": file_name, "status": "not_indexed", "num_chunks": None,
+                    "indexed_at": None, "error": None}
+            try:
+                ref.create(data)
+                return self._record(doc_id, data)
+            except AlreadyExists:  # created concurrently
+                snap = ref.get()
+        data = snap.to_dict() or {}
+        if data.get("file_name") != file_name:
+            ref.update({"file_name": file_name})
+            data["file_name"] = file_name
+        return self._record(doc_id, data)
+
+    def get(self, doc_id: str) -> DocumentRecord | None:
+        snap = self._col.document(doc_id).get()
+        return self._record(doc_id, snap.to_dict() or {}) if snap.exists else None
+
+    def all(self) -> list[DocumentRecord]:
+        recs = [self._record(s.id, s.to_dict() or {}) for s in self._col.stream()]
+        return sorted(recs, key=lambda r: r.file_name)
+
+    def try_mark_processing(self, doc_id: str) -> bool:
+        """Atomically claim the document for indexing (Firestore transaction)."""
+        ref = self._col.document(doc_id)
+
+        @self._firestore.transactional
+        def claim(tx: Any) -> bool:
+            snap = ref.get(transaction=tx)
+            if not snap.exists or (snap.to_dict() or {}).get("status") in ("processing", "ready"):
+                return False
+            tx.update(ref, {"status": "processing", "error": None})
+            return True
+
+        return claim(self._client.transaction())
+
+    def mark_ready(self, doc_id: str, num_chunks: int) -> None:
+        self._col.document(doc_id).update(
+            {"status": "ready", "num_chunks": num_chunks, "indexed_at": _now(), "error": None}
+        )
+
+    def mark_failed(self, doc_id: str, error: str) -> None:
+        self._col.document(doc_id).update({"status": "failed", "num_chunks": None, "error": error[:1000]})
+
+    def reset_status(self, doc_id: str) -> None:
+        self._col.document(doc_id).update(
+            {"status": "not_indexed", "num_chunks": None, "indexed_at": None, "error": None}
+        )
+
+    def reset_stale_processing(self) -> int:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        n = 0
+        for snap in self._col.where(filter=FieldFilter("status", "==", "processing")).stream():
+            snap.reference.update({"status": "not_indexed"})
+            n += 1
+        return n
+
+    def delete(self, doc_id: str) -> None:
+        self._col.document(doc_id).delete()
+
+
+def build_registry(settings: Any) -> Registry:
+    """Create the registry selected by ``REGISTRY_BACKEND``."""
+    kind = settings.registry_backend.lower()
+    if kind == "sqlite":
+        return DocumentRegistry(settings.sqlite_path)
+    if kind == "firestore":
+        return FirestoreRegistry(
+            settings.gcp_project, settings.firestore_database, settings.firestore_documents_collection
+        )
+    raise ValueError(f"Unknown REGISTRY_BACKEND: {settings.registry_backend}")

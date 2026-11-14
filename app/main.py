@@ -14,10 +14,11 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Req
 from pydantic import BaseModel, Field
 
 from app.config import get_settings, setup_logging
-from app.db import DocumentRegistry
+from app.db import build_registry
 from app.llm import LLMError
 from app.services import ContractService, DocumentNotFound, DocumentNotReady
-from app.vectorstore import VectorStore
+from app.sources import build_source
+from app.vectorstore import build_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +68,18 @@ class ChatResponse(BaseModel):
 
 
 def build_service() -> ContractService:
-    """Wire the service from settings."""
+    """Wire the service from settings (GCS/Firestore/Vertex AI by default)."""
     s = get_settings()
-    registry = DocumentRegistry(s.sqlite_path)
+    logger.info(
+        "Backends: source=%s registry=%s vectors=%s embeddings=%s/%s llm=%s/%s (vertexai=%s)",
+        s.contracts_source, s.registry_backend, s.vector_store, s.embedding_provider, s.embedding_model,
+        s.llm_provider, s.llm_model, s.use_vertexai,
+    )
+    registry = build_registry(s)
     reset = registry.reset_stale_processing()
     if reset:
         logger.warning("Reset %d document(s) left in 'processing' by a previous run", reset)
-    store = VectorStore(s.chroma_dir, s.chroma_collection)
-    return ContractService(s, registry, store)
+    return ContractService(s, build_source(s), registry, build_vector_store(s))
 
 
 @asynccontextmanager
@@ -82,7 +87,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     setup_logging(get_settings().log_level)
     if not hasattr(app.state, "service"):
         app.state.service = build_service()
-    logger.info("Backend ready. Contracts folder: %s", get_settings().contracts_dir.resolve())
+    logger.info("Backend ready")
     yield
 
 
